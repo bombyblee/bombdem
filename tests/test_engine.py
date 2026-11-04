@@ -339,3 +339,11 @@ def test_chip_conservation_random_play():
                 p.stack for p in t.last_result.removed
             ) == total
             total = sum(p.stack for p in t.players)
+
+
+def test_suits_use_colour_emoji_form():
+    from holdem.cards import format_cards
+
+    text = format_cards(parse_cards("Ah Kd Qs Jc Tc"))
+    assert text == "A♥️ K♦️ Q♠️ J♣️ 10♣️"
+    assert text.count("️") == 5

@@ -299,11 +299,19 @@ async def handle_events(ctx, chat_id: int, s: Session, events: list[Event], pref
         return
 
     text = "\n".join(lines + ([""] if lines else []) + [render_result(result, t)])
-    text += "\n\n" + after_hand_footer(ctx, chat_id, s)
-    await send(ctx, chat_id, text)
+    footer, can_start = after_hand_footer(s)
+    text += "\n\n" + footer
+    await send(ctx, chat_id, text, reply_markup=next_hand_keyboard(t) if can_start else None)
 
 
-def after_hand_footer(ctx, chat_id: int, s: Session) -> str:
+def next_hand_keyboard(t: Table) -> InlineKeyboardMarkup:
+    # Carries the finished hand's number so a second click can't deal two hands.
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("▶️ 다음 핸드 시작", callback_data=f"b:{t.hand_no}")]]
+    )
+
+
+def after_hand_footer(s: Session) -> tuple[str, bool]:
     t = s.table
     ready = sum(1 for p in t.players if t.can_be_dealt(p))
     away = [p for p in t.players if p.away and not p.leaving]
@@ -311,8 +319,8 @@ def after_hand_footer(ctx, chat_id: int, s: Session) -> str:
     if away:
         note = "\n💤 자리비움: " + ", ".join(esc(p.name) for p in away) + " — 복귀: /back"
     if ready >= 2:
-        return "▶️ 다음 핸드 시작: /ㄱㄱ (또는 /begin)" + note
-    return "⏸ 참여 가능한 플레이어가 부족합니다. /join · /rebuy · /back 후 /ㄱㄱ" + note
+        return "▶️ 다음 핸드: 아래 버튼 또는 /ㄱㄱ" + note, True
+    return "⏸ 참여 가능한 플레이어가 부족합니다. /join · /rebuy · /back 후 /ㄱㄱ" + note, False
 
 
 async def prompt_turn(ctx, chat_id: int, s: Session, lines: list[str]) -> None:
@@ -957,6 +965,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if p.folded:
             text += "\n(폴드함)"
         await q.answer(text, show_alert=True)
+        return
+
+    if parts[0] == "b":  # "next hand" button on a result message
+        async with s.lock:
+            t = s.table
+            stale = t.in_progress or t.hand_no != int(parts[1])
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            if stale:
+                await q.answer("이미 다음 핸드가 시작되었습니다.")
+                return
+            await q.answer()
+            await deal_new_hand(ctx, chat_id, s)
         return
 
     if parts[0] == "a":

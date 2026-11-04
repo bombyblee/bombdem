@@ -5,7 +5,9 @@ from dataclasses import dataclass
 
 RANK_CHARS = "23456789TJQKA"
 SUITS = "shdc"
-SUIT_SYMBOLS = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
+# U+FE0F asks for the colour emoji form (red ♥️♦️); without it Telegram may draw
+# plain monochrome text glyphs, e.g. inside bold text.
+SUIT_SYMBOLS = {"s": "♠️", "h": "♥️", "d": "♦️", "c": "♣️"}
 
 
 @dataclass(frozen=True)

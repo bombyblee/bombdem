@@ -62,6 +62,7 @@ class Harness:
         self.bot = FakeBot(blocked)
         self.jq = FakeJobQueue()
         self.replies = []
+        self.edited_markups = 0
 
     def ctx(self, args=(), job=None):
         return SimpleNamespace(bot=self.bot, job_queue=self.jq, args=list(args), job=job)
@@ -95,11 +96,15 @@ class Harness:
         async def answer(text=None, show_alert=False):
             answers.append(text)
 
+        async def edit_message_reply_markup(reply_markup=None):
+            self.edited_markups += 1
+
         q = SimpleNamespace(
             data=data,
             from_user=user(uid),
             message=SimpleNamespace(chat=SimpleNamespace(id=GROUP_ID)),
             answer=answer,
+            edit_message_reply_markup=edit_message_reply_markup,
         )
         await bot.on_callback(SimpleNamespace(callback_query=q), self.ctx())
         return answers
@@ -182,7 +187,7 @@ def test_full_game_flow():
             await h.press(uid, button(kb, label))
 
         last = h.bot.sent[-1][1]
-        assert "결과" in last and "다음 핸드 시작: /ㄱㄱ" in last
+        assert "결과" in last and "다음 핸드: 아래 버튼 또는 /ㄱㄱ" in last
         assert sum(p.stack for p in t.players) == 3 * bot.DEFAULT_STACK
 
         # stale button from the finished hand
@@ -207,7 +212,7 @@ def test_full_game_flow():
         # finish the hand and close
         while t.in_progress:
             await h.cmd(bot.make_action_cmd("fold"), t.current_player.user_id)
-        assert "다음 핸드 시작" in h.bot.sent[-1][1] and not t.in_progress
+        assert "다음 핸드:" in h.bot.sent[-1][1] and not t.in_progress
         await h.cmd(bot.cmd_closetable, 1)
         assert GROUP_ID not in bot.SESSIONS
 
@@ -528,5 +533,52 @@ def test_close_deletes_save_but_keeps_other_groups():
         await h.cmd(bot.cmd_closetable, OWNER)
         assert set(saved()) == {"-999"}  # the unloaded table is untouched
         assert saved()["-999"]["players"][0]["stack"] == 1234
+
+    run(scenario())
+
+
+def test_next_hand_button():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+        await h.say(1, "/ㄱㄱ")
+        await finish_hand(h, t)
+        _, text, kb = h.bot.sent[-1]
+        assert "결과" in text
+        data = button(kb, "▶️ 다음 핸드 시작")
+        assert data == "b:1"
+
+        await h.press(2, data)  # any seated player can start the next hand
+        assert t.in_progress and t.hand_no == 2 and h.edited_markups == 1
+        ans = await h.press(1, data)  # double click / old message
+        assert ans == ["이미 다음 핸드가 시작되었습니다."] and t.hand_no == 2
+
+        await finish_hand(h, t)
+        t.set_away(2, True)
+        await h.say(1, "/ㄱㄱ")  # only 1 player present → no hand, no button
+        await h.cmd(bot.cmd_back, 2)
+        await h.say(1, "/ㄱㄱ")
+        await finish_hand(h, t)
+        await h.say(1, "/ㄱㄱ")  # started by text: the result's button goes stale
+        ans = await h.press(2, f"b:{t.hand_no - 1}")
+        assert ans == ["이미 다음 핸드가 시작되었습니다."]
+
+    run(scenario())
+
+
+def test_no_button_when_not_enough_players():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+        await h.say(1, "/ㄱㄱ")
+        await h.cmd(bot.cmd_leave, t.current_player.user_id)  # leaving ends the hand
+        _, text, kb = h.bot.sent[-1]
+        assert "결과" in text and "부족" in text and kb is None
 
     run(scenario())
