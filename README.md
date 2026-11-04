@@ -49,6 +49,7 @@ copy .env.example .env      # .env 를 열어 BOT_TOKEN 입력
 | 🔑 봇 관리자 | `/newtable [스택] [SB] [BB]` | 테이블 생성. 저장된 테이블이 있으면 `/newtable new ...` 로만 덮어쓰기 |
 | | `/loadtable` | 저장된 스택·설정으로 테이블 불러오기 |
 | | `/closetable` | 최종 칩 집계 후 종료 (저장 기록도 삭제) |
+| | `/allow` | 이 그룹에서는 누구나 `/newtable`·`/closetable` 사용 가능 (`/allow off` 로 해제, 재시작 후에도 유지) |
 | | `/myid` | 내 텔레그램 ID 확인 (누구나 사용 가능) |
 | 🔍 기록 | `/hand` | 전판 내 패를 **그룹에 공개** |
 | | `/open` | 전판 커뮤니티 카드를 리버까지 공개 (중간에 끝난 핸드의 남은 카드 포함) |

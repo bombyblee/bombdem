@@ -101,6 +101,20 @@ def delete(path: str, chat_id: int) -> None:
         _write(path, data)
 
 
+def is_allowed(path: str, chat_id: int) -> bool:
+    """Has the bot owner opened /newtable·/closetable to everyone in this chat (/allow)?"""
+    return chat_id in _read(path).get("allowed_chats", [])
+
+
+def set_allowed(path: str, chat_id: int, allowed: bool) -> None:
+    data = _read(path)
+    chats = set(data.get("allowed_chats", []))
+    chats.add(chat_id) if allowed else chats.discard(chat_id)
+    data["allowed_chats"] = sorted(chats)
+    data["version"] = VERSION
+    _write(path, data)
+
+
 def restore(chat_id: int, snap: dict) -> Table:
     stack = snap["starting_stack"]
     # Saved blinds may exceed what the constructor allows (set later via /blinds),

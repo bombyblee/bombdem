@@ -493,6 +493,29 @@ def test_only_owner_manages_tables():
     run(scenario())
 
 
+def test_allow_opens_newtable_and_closetable():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_allow, 2)  # only the owner can /allow
+        assert "봇 관리자만" in h.replies[-1] and not storage.is_allowed(bot.TABLES_FILE, GROUP_ID)
+
+        await h.cmd(bot.cmd_allow, OWNER)
+        assert "누구나" in h.replies[-1]
+        await h.cmd(bot.cmd_newtable, 2)
+        assert GROUP_ID in bot.SESSIONS
+        await h.cmd(bot.cmd_closetable, 2)
+        assert GROUP_ID not in bot.SESSIONS
+        assert storage.is_allowed(bot.TABLES_FILE, GROUP_ID)  # survives table close/restart
+        await h.cmd(bot.cmd_loadtable, 2)
+        assert "봇 관리자만" in h.replies[-1]  # /loadtable stays owner-only
+
+        await h.cmd(bot.cmd_allow, OWNER, "off")
+        await h.cmd(bot.cmd_newtable, 2)
+        assert GROUP_ID not in bot.SESSIONS and "봇 관리자만" in h.replies[-1]
+
+    run(scenario())
+
+
 def test_no_owner_configured(monkeypatch):
     async def scenario():
         monkeypatch.setattr(bot, "OWNER_IDS", set())

@@ -277,8 +277,19 @@ def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
 
 
-async def require_owner(update: Update) -> bool:
+def chat_allowed(chat_id: int) -> bool:
+    try:
+        return storage.is_allowed(TABLES_FILE, chat_id)
+    except (OSError, ValueError):
+        log.exception("failed to read %s", TABLES_FILE)
+        return False
+
+
+async def require_owner(update: Update, allowable: bool = False) -> bool:
+    """Bot owner only — or anyone, for `allowable` commands in a chat the owner /allow-ed."""
     if is_owner(update.effective_user.id):
+        return True
+    if allowable and chat_allowed(update.effective_chat.id):
         return True
     if not OWNER_IDS:
         text = (
@@ -287,6 +298,8 @@ async def require_owner(update: Update) -> bool:
         )
     else:
         text = "테이블 생성/불러오기/닫기는 봇 관리자만 할 수 있습니다."
+        if allowable:
+            text += "\n(관리자가 이 방에서 /allow 하면 누구나 /newtable·/closetable 사용 가능)"
     await update.effective_message.reply_text(text)
     return False
 
@@ -465,6 +478,7 @@ HELP_GROUP = (
     "/newtable [스택] [SB] [BB] — 테이블 만들기\n"
     "/loadtable — 저장된 테이블(스택) 불러오기\n"
     "/closetable — 테이블 닫기 (저장 기록도 삭제)\n"
+    "/allow — 이 방에서 누구나 /newtable·/closetable 사용 허용 (/allow off 로 해제)\n"
     "/myid — 내 텔레그램 ID 확인\n\n"
     "<b>🔍 기록</b>\n"
     "/hand — 전판 내 패를 그룹에 공개\n"
@@ -502,7 +516,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_newtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     msg = update.effective_message
-    if not await require_owner(update):
+    if not await require_owner(update, allowable=True):
         return
     if chat.id in SESSIONS:
         await msg.reply_text("이미 이 방에 테이블이 있습니다. /status 로 확인하세요.")
@@ -543,6 +557,27 @@ async def cmd_newtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"참가: /join  (먼저 @{ctx.bot.username} 와 1:1 대화에서 /start)\n"
         "2명 이상 모이면 /begin",
     )
+
+
+async def cmd_allow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/allow — let everyone in this group use /newtable·/closetable. /allow off — revert."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not await require_owner(update):
+        return
+    off = bool(ctx.args) and ctx.args[0].lower() in ("off", "no", "해제", "끄기")
+    try:
+        storage.set_allowed(TABLES_FILE, chat.id, not off)
+    except OSError:
+        log.exception("failed to write %s", TABLES_FILE)
+        await msg.reply_text("⚠️ 설정을 저장하지 못했습니다. 봇 로그를 확인하세요.")
+        return
+    if off:
+        await msg.reply_text("🔒 이제 /newtable·/closetable 은 봇 관리자만 쓸 수 있습니다.")
+    else:
+        await msg.reply_text(
+            "🔓 이 방에서는 누구나 /newtable·/closetable 을 쓸 수 있습니다.\n되돌리기: /allow off"
+        )
 
 
 async def cmd_loadtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -691,7 +726,7 @@ async def cmd_closetable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not s:
         return
     chat_id = update.effective_chat.id
-    if not await require_owner(update):
+    if not await require_owner(update, allowable=True):
         return
     async with s.lock:
         if s.table.in_progress:
@@ -1094,6 +1129,7 @@ async def post_init(app: Application) -> None:
             BotCommand("newtable", "[관리자] 테이블 만들기 [스택] [SB] [BB]"),
             BotCommand("loadtable", "[관리자] 저장된 테이블 불러오기"),
             BotCommand("closetable", "[관리자] 테이블 닫기"),
+            BotCommand("allow", "[관리자] 이 방 누구나 newtable/closetable 허용 (off: 해제)"),
             BotCommand("help", "명령어 목록"),
         ],
         scope=BotCommandScopeAllGroupChats(),
@@ -1136,6 +1172,7 @@ def main() -> None:
     group_cmds = {
         "newtable": cmd_newtable,
         "loadtable": cmd_loadtable,
+        "allow": cmd_allow,
         "join": cmd_join,
         "leave": cmd_leave,
         "begin": cmd_startgame,
