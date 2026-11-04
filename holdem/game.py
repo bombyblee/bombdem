@@ -32,6 +32,8 @@ class Player:
     all_in: bool = False
     acted: bool = False  # acted since the last full raise on this street
     leaving: bool = False  # will be removed when the hand ends
+    away: bool = False  # sitting out: keeps seat and chips, not dealt in
+    timeouts: int = 0  # consecutive turn timeouts (reset on any real action)
     buy_in: int = 0  # total chips bought (starting stack + rebuys)
     rebuys: int = 0
 
@@ -188,6 +190,19 @@ class Table:
         self.current = (self.current - 1) % len(self.players)
         return self._advance(events)
 
+    @staticmethod
+    def can_be_dealt(p: Player) -> bool:
+        return p.stack > 0 and not p.leaving and not p.away
+
+    def set_away(self, user_id: int, away: bool) -> Player:
+        """Sit out / come back. Takes effect from the next hand; the current hand is unaffected."""
+        p = self.get_player(user_id)
+        if p is None:
+            raise GameError("테이블에 앉아 있지 않습니다.")
+        p.away = away
+        p.timeouts = 0
+        return p
+
     def _remove_index(self, i: int) -> None:
         del self.players[i]
         if i <= self.button:
@@ -245,9 +260,11 @@ class Table:
     def start_hand(self) -> list[Event]:
         if self.in_progress:
             raise GameError("이미 핸드가 진행 중입니다.")
-        seated = [p for p in self.players if p.stack > 0 and not p.leaving]
+        seated = [p for p in self.players if self.can_be_dealt(p)]
         if len(seated) < 2:
-            raise GameError("핸드를 시작하려면 칩이 있는 플레이어가 최소 2명 필요합니다.")
+            raise GameError(
+                "핸드를 시작하려면 칩이 있고 자리에 있는 플레이어가 최소 2명 필요합니다."
+            )
         if self.pending_blinds:
             self.small_blind, self.big_blind = self.pending_blinds
             self.pending_blinds = None
@@ -261,7 +278,7 @@ class Table:
             p.hole = []
             p.bet = p.total_bet = 0
             p.all_in = p.acted = False
-            p.in_hand = p.stack > 0 and not p.leaving
+            p.in_hand = self.can_be_dealt(p)
             p.folded = not p.in_hand
 
         self.button = self._next_in_hand(self.button)

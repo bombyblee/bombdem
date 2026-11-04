@@ -223,6 +223,25 @@ def test_busted_player_removed(monkeypatch):
     assert t2.get_player(100).in_hand
 
 
+def test_away_player_not_dealt():
+    t = make_table(3)
+    t.set_away(100, True)
+    t.start_hand()
+    away = t.get_player(100)
+    assert not away.in_hand and away.hole == [] and away.total_bet == 0
+    assert t.players[t.button] is not away  # heads-up between the other two
+    assert t.sb_index == t.button
+    while t.in_progress:
+        t.act(uid(t), "fold")
+    assert away.stack == 10_000
+    t.set_away(101, True)
+    with pytest.raises(GameError):
+        t.start_hand()  # only one player present
+    t.set_away(100, False)
+    t.start_hand()
+    assert away.in_hand
+
+
 def test_rebuy_rules():
     t = make_table(3)
     with pytest.raises(GameError):

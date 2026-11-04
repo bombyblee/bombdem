@@ -124,8 +124,13 @@ def button(kb, startswith):
     raise AssertionError(f"no button {startswith}: {[b.text for r in kb.inline_keyboard for b in r]}")
 
 
+OWNER = 1  # user 1 is the bot owner in every test
+
+
 @pytest.fixture(autouse=True)
-def clean_sessions():
+def clean_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "OWNER_IDS", {OWNER})
+    monkeypatch.setattr(bot, "TABLES_FILE", str(tmp_path / "tables.json"))
     bot.SESSIONS.clear()
     yield
     bot.SESSIONS.clear()
@@ -223,7 +228,10 @@ def test_join_requires_dm():
 def test_korean_shortcuts():
     async def scenario():
         h = Harness()
-        assert await h.say(1, "/ㄹㄷ")  # auto-creates the table
+        assert await h.say(2, "/ㄹㄷ")  # no table yet: /join doesn't create one any more
+        assert GROUP_ID not in bot.SESSIONS and "/newtable" in h.replies[-1]
+        await h.cmd(bot.cmd_newtable, OWNER)
+        assert await h.say(1, "/ㄹㄷ")
         assert await h.say(2, "/ㄹㄷ@holdem_dealer_bot")
         t = bot.SESSIONS[GROUP_ID].table
         assert [p.user_id for p in t.players] == [1, 2]
@@ -251,6 +259,7 @@ def test_korean_shortcuts():
 def test_settings_and_records():
     async def scenario():
         h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
         await h.cmd(bot.cmd_join, 1)
         await h.cmd(bot.cmd_join, 2)
         s = bot.SESSIONS[GROUP_ID]
@@ -274,10 +283,11 @@ def test_settings_and_records():
         await h.cmd(bot.make_action_cmd("fold"), t.current_player.user_id)  # preflop fold
         assert not t.in_progress
 
-        await h.cmd(bot.cmd_hand, 1)
-        assert h.replies[-1].startswith("📩")
-        dm = h.bot.sent[-1]
-        assert dm[0] == 1 and "전판" in dm[1] and str(holes[1][0]) in dm[1]
+        await h.cmd(bot.cmd_hand, 1)  # posted publicly in the group, not DM'd
+        chat_id, text, _ = h.bot.sent[-1]
+        assert chat_id == GROUP_ID and "패 공개" in text
+        assert f"{holes[1][0]} {holes[1][1]}" in text
+        assert f"{holes[2][0]} {holes[2][1]}" not in text  # only the requester's cards
 
         await h.cmd(bot.cmd_hand, 2, chat_id=2)  # in DM
         assert str(holes[2][0]) in h.replies[-1]
@@ -300,6 +310,93 @@ def test_settings_and_records():
     run(scenario())
 
 
+async def finish_hand(h, t):
+    while t.in_progress:
+        await h.cmd(bot.make_action_cmd("fold"), t.current_player.user_id)
+
+
+async def wait_for_turn(h, t, uid):
+    """Others call/check until it's uid's turn (calling keeps the hand alive)."""
+    while t.current_player.user_id != uid:
+        await h.cmd(bot.make_action_cmd("call"), t.current_player.user_id)
+
+
+def test_auto_away_after_two_timeouts():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2, 3, 4):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+        afk = t.get_player(1)
+
+        for hand in (1, 2):
+            await h.say(2, "/ㄱㄱ")
+            if afk.in_hand:
+                await wait_for_turn(h, t, 1)
+                await h.fire("turn:")
+            await finish_hand(h, t)
+        assert afk.timeouts == 0 and afk.away  # 2nd timeout → away (counter reset)
+        texts = [txt for c, txt, _ in h.bot.sent if c == GROUP_ID]
+        assert any("연속 2회 시간 초과" in x and "자리비움" in x for x in texts)
+        assert "💤 자리비움: User1" in texts[-1]
+
+        await h.say(2, "/ㄱㄱ")
+        assert not afk.in_hand and t.in_progress  # sat out: not dealt, no blinds
+        assert afk.hole == []
+        stack_before = afk.stack
+        await finish_hand(h, t)
+        assert afk.stack == stack_before
+
+        await h.cmd(bot.cmd_players, 2)
+        assert "💤 자리비움" in h.bot.sent[-1][1]
+
+        await h.cmd(bot.cmd_back, 1)
+        assert not afk.away and "복귀" in h.bot.sent[-1][1]
+        await h.cmd(bot.cmd_back, 1)
+        assert h.replies[-1] == "자리비움 상태가 아닙니다."
+        await h.say(2, "/ㄱㄱ")
+        assert afk.in_hand
+
+    run(scenario())
+
+
+def test_real_action_resets_timeout_counter():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2, 3):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+        p = t.get_player(1)
+        p.timeouts = 1  # one strike already
+        await h.say(2, "/ㄱㄱ")
+        await wait_for_turn(h, t, 1)
+        label = "✔️ 체크" if t.legal_actions().can_check else "📞 콜"
+        await h.press(1, button(h.last_keyboard(), label))
+        assert p.timeouts == 0 and not p.away
+
+    run(scenario())
+
+
+def test_away_join_returns_and_too_few_players():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        await h.cmd(bot.cmd_join, 1)
+        await h.cmd(bot.cmd_join, 2)
+        t = bot.SESSIONS[GROUP_ID].table
+        t.set_away(1, True)
+        await h.say(2, "/ㄱㄱ")
+        assert not t.in_progress and "최소 2명" in h.bot.sent[-1][1]
+        await h.say(1, "/ㄹㄷ")  # /join while away = /back
+        assert not t.get_player(1).away and len(t.players) == 2
+        await h.say(2, "/ㄱㄱ")
+        assert t.in_progress
+
+    run(scenario())
+
+
 def test_leave_on_turn_ends_hand():
     async def scenario():
         h = Harness()
@@ -315,5 +412,121 @@ def test_leave_on_turn_ends_hand():
         assert "떠납니다" in text and "결과" in text and "퇴장" in text
         assert [p.user_id for p in t.players] != [] and t.get_player(leaver) is None
         assert "플레이어가 부족" in text
+
+    run(scenario())
+
+
+# ---------------------------------------------------------------- owner & persistence
+import json
+
+import storage
+
+
+def saved():
+    with open(bot.TABLES_FILE, encoding="utf-8") as f:
+        return json.load(f)["tables"]
+
+
+def test_only_owner_manages_tables():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, 2)
+        assert GROUP_ID not in bot.SESSIONS and "봇 관리자만" in h.replies[-1]
+        await h.cmd(bot.cmd_loadtable, 2)
+        assert "봇 관리자만" in h.replies[-1]
+        await h.cmd(bot.cmd_newtable, OWNER)
+        await h.cmd(bot.cmd_closetable, 2)
+        assert GROUP_ID in bot.SESSIONS and "봇 관리자만" in h.replies[-1]
+        await h.cmd(bot.cmd_closetable, OWNER)
+        assert GROUP_ID not in bot.SESSIONS
+
+    run(scenario())
+
+
+def test_no_owner_configured(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(bot, "OWNER_IDS", set())
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, 1)
+        assert GROUP_ID not in bot.SESSIONS and "/myid" in h.replies[-1]
+        await h.cmd(bot.cmd_myid, 1, chat_id=1)
+        assert "<code>1</code>" in h.replies[-1]
+
+    run(scenario())
+
+
+def test_save_and_load_after_restart():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2, 3):
+            await h.cmd(bot.cmd_join, uid)
+        await h.cmd(bot.cmd_blinds, 1, "300", "600")
+        await h.cmd(bot.cmd_timer, 1, "20")
+        t = bot.SESSIONS[GROUP_ID].table
+
+        await h.say(1, "/ㄱㄱ")  # hand 1: play it out
+        await finish_hand(h, t)
+        after_hand1 = {p.user_id: p.stack for p in t.players}
+        assert sum(after_hand1.values()) == 3 * bot.DEFAULT_STACK
+        assert {d["user_id"]: d["stack"] for d in saved()[str(GROUP_ID)]["players"]} == after_hand1
+
+        t.get_player(3).away = True
+        await h.say(1, "/ㄱㄱ")  # hand 2: chips go in, then the bot "crashes" mid-hand
+        uid = t.current_player.user_id
+        await h.cmd(bot.make_action_cmd("raise"), uid, "5000")
+        assert t.in_progress and t.pot_total > 0
+        # Shutdown hook saves; the running hand is cancelled and bets refunded.
+        await bot.post_shutdown(None)
+        bot.SESSIONS.clear()  # restart: memory is gone
+
+        await h.cmd(bot.cmd_join, 2)
+        assert "/loadtable" in h.replies[-1]  # nothing open until the owner loads
+        await h.cmd(bot.cmd_loadtable, OWNER)
+        s = bot.SESSIONS[GROUP_ID]
+        t2 = s.table
+        assert {p.user_id: p.stack for p in t2.players} == after_hand1
+        assert (t2.small_blind, t2.big_blind, s.turn_timeout) == (300, 600, 20)
+        assert t2.get_player(3).away and not t2.in_progress
+        assert "불러오기 완료" in h.bot.sent[-1][1]
+
+        await h.cmd(bot.cmd_loadtable, OWNER)
+        assert "이미" in h.replies[-1]
+        await h.say(1, "/ㄱㄱ")  # carries on with restored stacks
+        assert t2.in_progress and t2.players[t2.bb_index].bet == 600
+
+    run(scenario())
+
+
+def test_newtable_protects_saved_table():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        await h.cmd(bot.cmd_join, 1)
+        bot.SESSIONS.clear()  # restart
+        await h.cmd(bot.cmd_newtable, OWNER)
+        assert GROUP_ID not in bot.SESSIONS and "/loadtable" in h.replies[-1]
+        await h.cmd(bot.cmd_newtable, OWNER, "new", "50000", "500", "1000")
+        t = bot.SESSIONS[GROUP_ID].table
+        assert (t.starting_stack, t.big_blind, t.players) == (50_000, 1000, [])
+        assert saved()[str(GROUP_ID)]["players"] == []
+
+    run(scenario())
+
+
+def test_close_deletes_save_but_keeps_other_groups():
+    async def scenario():
+        h = Harness()
+        other = storage.snapshot(storage.restore(-999, {
+            "starting_stack": 1000, "small_blind": 5, "big_blind": 10,
+            "players": [{"user_id": 7, "name": "X", "stack": 1234}],
+        }), "다른방", OWNER, 60)
+        storage.save(bot.TABLES_FILE, {-999: other})
+        await h.cmd(bot.cmd_newtable, OWNER)
+        await h.cmd(bot.cmd_join, 1)
+        assert set(saved()) == {"-999", str(GROUP_ID)}
+        await h.cmd(bot.cmd_closetable, OWNER)
+        assert set(saved()) == {"-999"}  # the unloaded table is untouched
+        assert saved()["-999"]["players"][0]["stack"] == 1234
 
     run(scenario())

@@ -36,6 +36,8 @@ from holdem.cards import format_cards
 from holdem.evaluator import partial_hand_name
 from holdem.game import Event, GameError, HandResult, Player, Table
 
+import storage
+
 try:
     from dotenv import load_dotenv
 
@@ -53,6 +55,12 @@ DEFAULT_SB = int(os.getenv("DEFAULT_SB", "200"))
 DEFAULT_BB = int(os.getenv("DEFAULT_BB", "500"))
 REBUY_AMOUNT = int(os.getenv("REBUY_AMOUNT", "30000"))
 TIMER_MIN, TIMER_MAX = 5, 120
+AWAY_AFTER = max(1, int(os.getenv("AWAY_AFTER", "2")))  # consecutive timeouts → sit out
+TABLES_FILE = os.getenv(
+    "TABLES_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tables.json")
+)
+# Telegram user IDs allowed to create/load/close tables (comma-separated). Find yours with /myid.
+OWNER_IDS = {int(x) for x in os.getenv("TELEGRAM_CHAT_IDS", "").replace(" ", "").split(",") if x}
 
 # Telegram only allows [a-z0-9_] in real commands, so Korean shortcuts arrive as
 # plain text and are routed by regex (see on_korean_shortcut).
@@ -132,6 +140,8 @@ def render_table(t: Table) -> str:
             status += " · 퇴장예정"
         elif p.stack == 0 and not (t.in_progress and p.live):
             status += " · 칩 없음 (/rebuy)"
+        if p.away and not p.leaving:
+            status = status.replace(" · 대기", "") + " · 💤 자리비움"
         lines.append(f"{marker} {esc(p.name)}{tag} — {chips(p.stack)}{status}")
     if not t.players:
         lines.append("(아직 아무도 앉지 않았습니다 — /join)")
@@ -238,9 +248,42 @@ async def send(ctx, chat_id: int, text: str, **kw):
     )
 
 
+def persist(*sessions: Session) -> None:
+    """Save stacks to disk. Never let a disk problem break the game."""
+    try:
+        storage.save(
+            TABLES_FILE,
+            {
+                s.table.chat_id: storage.snapshot(s.table, s.title, s.creator_id, s.turn_timeout)
+                for s in sessions
+            },
+        )
+    except Exception:
+        log.exception("failed to save tables to %s", TABLES_FILE)
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+async def require_owner(update: Update) -> bool:
+    if is_owner(update.effective_user.id):
+        return True
+    if not OWNER_IDS:
+        text = (
+            "봇 관리자가 설정되지 않았습니다.\n"
+            "봇 DM에서 /myid 로 내 ID를 확인한 뒤 .env 의 TELEGRAM_CHAT_IDS 에 넣고 봇을 다시 실행하세요."
+        )
+    else:
+        text = "테이블 생성/불러오기/닫기는 봇 관리자만 할 수 있습니다."
+    await update.effective_message.reply_text(text)
+    return False
+
+
 async def handle_events(ctx, chat_id: int, s: Session, events: list[Event], prefix=()) -> None:
     """Publish what just happened, then either prompt the next player or wrap up the hand."""
     t = s.table
+    persist(s)  # after every action, so even a hard kill loses at most the running hand
     cancel_jobs(ctx, f"turn:{chat_id}")
     await clear_turn_keyboard(ctx, chat_id, s)
     lines = list(prefix)
@@ -261,10 +304,15 @@ async def handle_events(ctx, chat_id: int, s: Session, events: list[Event], pref
 
 
 def after_hand_footer(ctx, chat_id: int, s: Session) -> str:
-    ready = sum(1 for p in s.table.players if p.stack > 0 and not p.leaving)
+    t = s.table
+    ready = sum(1 for p in t.players if t.can_be_dealt(p))
+    away = [p for p in t.players if p.away and not p.leaving]
+    note = ""
+    if away:
+        note = "\n💤 자리비움: " + ", ".join(esc(p.name) for p in away) + " — 복귀: /back"
     if ready >= 2:
-        return "▶️ 다음 핸드 시작: /ㄱㄱ (또는 /begin)"
-    return "⏸ 칩이 있는 플레이어가 부족합니다. /join 또는 /rebuy 후 /ㄱㄱ"
+        return "▶️ 다음 핸드 시작: /ㄱㄱ (또는 /begin)" + note
+    return "⏸ 참여 가능한 플레이어가 부족합니다. /join · /rebuy · /back 후 /ㄱㄱ" + note
 
 
 async def prompt_turn(ctx, chat_id: int, s: Session, lines: list[str]) -> None:
@@ -333,8 +381,16 @@ async def apply_action(ctx, chat_id: int, s: Session, user_id: int, action: str,
             events = s.table.act(user_id, action, amount)
         except GameError as e:
             return str(e)
+        reset_timeouts(s, user_id)
         await handle_events(ctx, chat_id, s, events)
     return None
+
+
+def reset_timeouts(s: Session, user_id: int) -> None:
+    """A real action proves the player is present."""
+    p = s.table.get_player(user_id)
+    if p:
+        p.timeouts = 0
 
 
 # ====================================================================== jobs
@@ -349,12 +405,20 @@ async def turn_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not t.in_progress or t.hand_no != d["hand"] or t.action_seq != d["seq"]:
             return
         p = t.current_player
-        action = "check" if t.legal_actions().can_check else "fold"
+        p.timeouts += 1
+        going_away = p.timeouts >= AWAY_AFTER
+        # Once marked away, fold rather than check so they don't stall later streets too.
+        action = "check" if t.legal_actions().can_check and not going_away else "fold"
         events = t.act(p.user_id, action)
         word = "체크" if action == "check" else "폴드"
-        await handle_events(
-            ctx, chat_id, s, events, prefix=[f"⏰ {esc(p.name)} 시간 초과 → 자동 {word}"]
-        )
+        prefix = [f"⏰ {esc(p.name)} 시간 초과 → 자동 {word}"]
+        if going_away:
+            t.set_away(p.user_id, True)
+            prefix.append(
+                f"💤 {esc(p.name)} 연속 {AWAY_AFTER}회 시간 초과 → <b>자리비움</b> "
+                "(다음 핸드부터 제외, 복귀: /back)"
+            )
+        await handle_events(ctx, chat_id, s, events, prefix=prefix)
 
 
 # ====================================================================== group commands
@@ -362,9 +426,10 @@ HELP_GROUP = (
     "<b>📖 홀덤봇 명령어 목록</b>\n"
     "처음 한 번은 봇과 1:1 대화에서 /start (또는 /ㅎㅇ) — 패를 DM으로 받기 위해 필요\n\n"
     "<b>👥 참가 관련</b>\n"
-    "/join — 게임에 참가 (테이블이 없으면 자동 생성, 시작 칩 {stack})\n"
+    "/join — 게임에 참가 (시작 칩 {stack})\n"
     "/leave — 게임에서 나가기 (핸드 중이면 폴드 처리 후 퇴장)\n"
     "/players — 현재 참가자 목록 확인\n"
+    "/back — 자리비움에서 복귀 (연속 {away}회 시간 초과 시 자동 자리비움)\n"
     "/rebuy — 칩이 부족할 때 리바인 ({rebuy} 추가)\n\n"
     "<b>🎮 게임 진행</b>\n"
     "/begin — 핸드 시작 (2명 이상 필요, 매 핸드마다 /ㄱㄱ)\n"
@@ -377,10 +442,13 @@ HELP_GROUP = (
     "<b>⚙️ 설정</b>\n"
     "/blinds SB BB — 블라인드 설정 (예: /blinds 200 400)\n"
     "/timer 초 — 액션 타임아웃 설정 ({tmin}~{tmax}초, 예: /timer 30)\n"
-    "/newtable [스택] [SB] [BB] — 설정을 지정해 테이블 만들기\n"
-    "/closetable — 테이블 닫기 (만든 사람 또는 관리자)\n\n"
+    "\n<b>🔑 봇 관리자 전용</b>\n"
+    "/newtable [스택] [SB] [BB] — 테이블 만들기\n"
+    "/loadtable — 저장된 테이블(스택) 불러오기\n"
+    "/closetable — 테이블 닫기 (저장 기록도 삭제)\n"
+    "/myid — 내 텔레그램 ID 확인\n\n"
     "<b>🔍 기록</b>\n"
-    "/hand — 전판 내 패 확인 (DM으로 전송)\n"
+    "/hand — 전판 내 패를 그룹에 공개\n"
     "/open — 전판 커뮤니티 카드 전체 공개 (리버까지)\n\n"
     "<b>⌨️ 한글 단축키</b>\n"
     "/ㄹㄷ → /join\n"
@@ -392,7 +460,11 @@ HELP_GROUP = (
 
 def help_text() -> str:
     return HELP_GROUP.format(
-        stack=chips(DEFAULT_STACK), rebuy=chips(REBUY_AMOUNT), tmin=TIMER_MIN, tmax=TIMER_MAX
+        stack=chips(DEFAULT_STACK),
+        rebuy=chips(REBUY_AMOUNT),
+        tmin=TIMER_MIN,
+        tmax=TIMER_MAX,
+        away=AWAY_AFTER,
     )
 
 
@@ -411,11 +483,25 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_newtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     msg = update.effective_message
+    if not await require_owner(update):
+        return
     if chat.id in SESSIONS:
         await msg.reply_text("이미 이 방에 테이블이 있습니다. /status 로 확인하세요.")
         return
+    args = list(ctx.args)
+    force = bool(args) and args[0].lower() == "new"
+    if force:
+        args = args[1:]
+    saved = storage.get(TABLES_FILE, chat.id)
+    if saved and not force:
+        await msg.reply_text(
+            f"이 방에 저장된 테이블이 있습니다 ({len(saved['players'])}명, {saved['saved_at'][:10]}).\n"
+            "• 이어서 하기: /loadtable\n"
+            "• 저장된 스택을 버리고 새로 만들기: /newtable new [스택] [SB] [BB]"
+        )
+        return
     try:
-        nums = [int(x.replace(",", "")) for x in ctx.args]
+        nums = [int(x.replace(",", "")) for x in args]
     except ValueError:
         await msg.reply_text("사용법: /newtable [시작스택] [SB] [BB]  예) /newtable 30000 200 500")
         return
@@ -426,10 +512,11 @@ async def cmd_newtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         sb = nums[1] if len(nums) > 1 else max(1, stack // 200)
         bb = nums[2] if len(nums) > 2 else sb * 2
     try:
-        create_session(update, stack, sb, bb)
+        s = create_session(update, stack, sb, bb)
     except GameError as e:
         await msg.reply_text(str(e))
         return
+    persist(s)
     await send(
         ctx,
         chat.id,
@@ -439,6 +526,39 @@ async def cmd_newtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_loadtable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not await require_owner(update):
+        return
+    if chat.id in SESSIONS:
+        await msg.reply_text("이미 이 방에 테이블이 열려 있습니다. /status 로 확인하세요.")
+        return
+    try:
+        snap = storage.get(TABLES_FILE, chat.id)
+    except (OSError, ValueError):
+        log.exception("failed to read %s", TABLES_FILE)
+        await msg.reply_text("⚠️ 저장 파일을 읽지 못했습니다. 봇 로그를 확인하세요.")
+        return
+    if snap is None:
+        await msg.reply_text("이 방에 저장된 테이블이 없습니다. /newtable 로 새로 만드세요.")
+        return
+    table = storage.restore(chat.id, snap)
+    s = Session(table, chat.title or snap.get("title") or "홀덤", snap.get("owner_id") or update.effective_user.id)
+    s.turn_timeout = snap.get("turn_timeout", TURN_TIMEOUT)
+    SESSIONS[chat.id] = s
+    lines = [
+        f"📂 <b>테이블 불러오기 완료</b> ({snap['saved_at'][:16].replace('T', ' ')} UTC 저장)",
+        f"블라인드 {chips(table.small_blind)}/{chips(table.big_blind)} · 타이머 {s.turn_timeout}초",
+        "",
+    ]
+    for p in table.players:
+        tag = " 💤" if p.away else ""
+        lines.append(f"• {mention(p)} {chips(p.stack)}{tag}")
+    lines += ["", "새로 앉으려면 /join · 시작은 /ㄱㄱ"]
+    await send(ctx, chat.id, "\n".join(lines))
+
+
 def get_session(update: Update) -> Session | None:
     return SESSIONS.get(update.effective_chat.id)
 
@@ -446,15 +566,22 @@ def get_session(update: Update) -> Session | None:
 async def require_session(update: Update) -> Session | None:
     s = get_session(update)
     if s is None:
-        await update.effective_message.reply_text("테이블이 없습니다. /newtable 로 만들어주세요.")
+        await update.effective_message.reply_text(
+            "테이블이 없습니다. 봇 관리자가 /newtable 또는 /loadtable 로 열어야 합니다."
+        )
     return s
 
 
 async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    s = get_session(update) or create_session(update, DEFAULT_STACK, DEFAULT_SB, DEFAULT_BB)
+    s = await require_session(update)
+    if not s:
+        return
     user = update.effective_user
     msg = update.effective_message
     existing = s.table.get_player(user.id)
+    if existing and existing.away and not existing.leaving:
+        await cmd_back(update, ctx)  # /join while sitting out = come back
+        return
     if existing and not existing.leaving:
         await msg.reply_text("이미 테이블에 앉아 있습니다.")
         return
@@ -482,6 +609,7 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(str(e))
             return
         t = s.table
+        persist(s)
         note = " (다음 핸드부터 참여)" if t.in_progress and not p.in_hand else ""
         await send(
             ctx,
@@ -509,8 +637,10 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 ctx, chat_id, s, events, prefix=[f"🚪 {esc(p.name)} 님이 폴드하고 테이블을 떠납니다."]
             )
         elif p in t.players:  # mid-hand but not dealt in / already folded
+            persist(s)
             await send(ctx, chat_id, f"🚪 {esc(p.name)} 님은 이번 핸드가 끝나면 퇴장합니다.")
         else:
+            persist(s)
             await send(ctx, chat_id, f"🚪 {esc(p.name)} 퇴장 (칩 {chips(p.stack)})")
 
 
@@ -538,8 +668,7 @@ async def cmd_closetable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not s:
         return
     chat_id = update.effective_chat.id
-    if update.effective_user.id != s.creator_id and not await is_admin(update, ctx):
-        await update.effective_message.reply_text("테이블을 만든 사람 또는 방 관리자만 닫을 수 있습니다.")
+    if not await require_owner(update):
         return
     async with s.lock:
         if s.table.in_progress:
@@ -549,6 +678,10 @@ async def cmd_closetable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             return
         cancel_jobs(ctx, f"turn:{chat_id}")
         del SESSIONS[chat_id]
+        try:
+            storage.delete(TABLES_FILE, chat_id)  # finished table: nothing left to /loadtable
+        except Exception:
+            log.exception("failed to delete saved table %s", chat_id)
         standings = sorted(s.table.players, key=lambda p: -p.stack)
         lines = ["🏁 <b>테이블 종료</b> — 최종 칩"]
         for i, p in enumerate(standings, 1):
@@ -577,6 +710,8 @@ async def cmd_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             extra.append("다음 핸드부터")
         if p.leaving:
             extra.append("퇴장예정")
+        elif p.away:
+            extra.append("💤 자리비움")
         tail = f" ({', '.join(extra)})" if extra else ""
         lines.append(f"{i}. {mention(p)} — {chips(p.stack)}{tail}")
     await send(ctx, update.effective_chat.id, "\n".join(lines))
@@ -592,10 +727,34 @@ async def cmd_rebuy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except GameError as e:
             await update.effective_message.reply_text(f"⚠️ {e}")
             return
+        persist(s)
         await send(
             ctx,
             update.effective_chat.id,
             f"💳 {mention(p)} 리바인 +{chips(REBUY_AMOUNT)} → {chips(p.stack)} (총 {p.rebuys}회)",
+        )
+
+
+async def cmd_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = await require_session(update)
+    if not s:
+        return
+    async with s.lock:
+        t = s.table
+        p = t.get_player(update.effective_user.id)
+        if p is None:
+            await update.effective_message.reply_text("테이블에 앉아 있지 않습니다. /join 으로 참가하세요.")
+            return
+        if not p.away:
+            await update.effective_message.reply_text("자리비움 상태가 아닙니다.")
+            return
+        t.set_away(p.user_id, False)
+        persist(s)
+        when = "다음 핸드부터" if t.in_progress else "이번 /ㄱㄱ 부터"
+        await send(
+            ctx,
+            update.effective_chat.id,
+            f"🙋 {mention(p)} 복귀 — {when} 참여합니다. (칩 {chips(p.stack)})",
         )
 
 
@@ -623,6 +782,7 @@ async def cmd_blinds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except GameError as e:
             await msg.reply_text(f"⚠️ {e}")
             return
+        persist(s)
     when = "" if now else " (다음 핸드부터 적용)"
     await send(ctx, update.effective_chat.id, f"⚙️ 블라인드 {chips(sb)}/{chips(bb)}{when}")
 
@@ -641,6 +801,7 @@ async def cmd_timer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(f"⚠️ 타임아웃은 {TIMER_MIN}~{TIMER_MAX}초 사이로 설정하세요.")
         return
     s.turn_timeout = sec
+    persist(s)
     await send(ctx, update.effective_chat.id, f"⏱ 액션 타임아웃 {sec}초 (다음 차례부터 적용)")
 
 
@@ -670,16 +831,32 @@ async def cmd_hand(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = await require_session(update)
     if not s:
         return
-    text = last_hand_text(s, uid)
-    if text is None:
+    r = s.table.last_result
+    if r is None or uid not in r.holes:
         await msg.reply_text("전판에 참여한 기록이 없습니다.")
         return
-    try:
-        await send(ctx, uid, text)  # never show hole cards in the group
-    except (Forbidden, BadRequest):
-        await msg.reply_text("DM을 보낼 수 없습니다. 봇과 1:1 대화에서 /start 를 눌러주세요.")
-        return
-    await msg.reply_text("📩 전판 패를 DM으로 보냈습니다.")
+    # Public reveal in the group: the player chooses to show their own previous hand.
+    hole = r.holes[uid]
+    p = s.table.get_player(uid)
+    who = mention(p) if p else esc(display_name(update.effective_user))
+    lines = [
+        f"🔍 {who} 님의 핸드 #{r.hand_no} 패 공개",
+        f"패: <b>{format_cards(hole)}</b>",
+        f"보드: {format_cards(r.board)}",
+    ]
+    if r.board:
+        lines.append(f"족보: {partial_hand_name(hole + r.board)}")
+    await send(ctx, update.effective_chat.id, "\n".join(lines))
+
+
+async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    owner = " (봇 관리자)" if is_owner(uid) else ""
+    await update.effective_message.reply_text(
+        f"내 텔레그램 ID: <code>{uid}</code>{owner}\n"
+        "봇 관리자로 지정하려면 .env 에 <code>TELEGRAM_CHAT_IDS=" + str(uid) + "</code> 를 넣고 봇을 다시 실행하세요.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -798,6 +975,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             try:
                 events = t.act(q.from_user.id, action, int(amount) or None)
+                reset_timeouts(s, q.from_user.id)
             except GameError as e:
                 await q.answer(str(e), show_alert=True)
                 return
@@ -863,6 +1041,7 @@ async def post_init(app: Application) -> None:
             BotCommand("leave", "게임에서 나가기"),
             BotCommand("players", "참가자 목록"),
             BotCommand("rebuy", f"리바인 ({REBUY_AMOUNT:,} 추가)"),
+            BotCommand("back", "자리비움에서 복귀"),
             BotCommand("begin", "핸드 시작"),
             BotCommand("status", "게임/로비 상태"),
             BotCommand("call", "콜"),
@@ -872,10 +1051,11 @@ async def post_init(app: Application) -> None:
             BotCommand("allin", "올인"),
             BotCommand("blinds", "블라인드 설정 (예: /blinds 200 400)"),
             BotCommand("timer", "액션 타임아웃 (예: /timer 30)"),
-            BotCommand("hand", "전판 내 패 확인 (DM)"),
+            BotCommand("hand", "전판 내 패 그룹에 공개"),
             BotCommand("open", "전판 커뮤니티 카드 전체 공개"),
-            BotCommand("newtable", "테이블 만들기 [스택] [SB] [BB]"),
-            BotCommand("closetable", "테이블 닫기"),
+            BotCommand("newtable", "[관리자] 테이블 만들기 [스택] [SB] [BB]"),
+            BotCommand("loadtable", "[관리자] 저장된 테이블 불러오기"),
+            BotCommand("closetable", "[관리자] 테이블 닫기"),
             BotCommand("help", "명령어 목록"),
         ],
         scope=BotCommandScopeAllGroupChats(),
@@ -885,31 +1065,46 @@ async def post_init(app: Application) -> None:
             BotCommand("start", "봇 DM 활성화"),
             BotCommand("mycards", "진행 중인 내 패 보기"),
             BotCommand("hand", "전판 내 패 확인"),
+            BotCommand("myid", "내 텔레그램 ID 확인"),
         ],
         scope=BotCommandScopeAllPrivateChats(),
     )
+
+
+async def post_shutdown(app: Application) -> None:
+    """Ctrl+C / normal stop: save every open table one last time."""
+    if SESSIONS:
+        persist(*SESSIONS.values())
+        log.info("saved %d table(s) to %s", len(SESSIONS), TABLES_FILE)
 
 
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("BOT_TOKEN 환경변수를 설정하세요 (.env 파일 또는 환경변수).")
-    app = Application.builder().token(token).post_init(post_init).build()
+    if not OWNER_IDS:
+        log.warning("TELEGRAM_CHAT_IDS 미설정: /newtable·/loadtable 을 아무도 쓸 수 없습니다. 봇 DM에서 /myid 로 확인하세요.")
+    app = (
+        Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start_private, filters=PRIVATE))
     app.add_handler(CommandHandler("mycards", cmd_mycards, filters=PRIVATE))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("hand", cmd_hand))  # group: DMs the cards; private: lists them
+    app.add_handler(CommandHandler("hand", cmd_hand))  # group: public reveal; private: lists them
+    app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(KOREAN_RE), on_korean_shortcut))
 
     group_cmds = {
         "newtable": cmd_newtable,
+        "loadtable": cmd_loadtable,
         "join": cmd_join,
         "leave": cmd_leave,
         "begin": cmd_startgame,
         "startgame": cmd_startgame,
         "players": cmd_players,
         "rebuy": cmd_rebuy,
+        "back": cmd_back,
         "blinds": cmd_blinds,
         "timer": cmd_timer,
         "open": cmd_open,
