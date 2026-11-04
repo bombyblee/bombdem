@@ -421,6 +421,51 @@ def test_leave_on_turn_ends_hand():
     run(scenario())
 
 
+def test_rejoin_restores_previous_stack():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2, 3):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+
+        # Leave between hands with a non-default stack, then come back.
+        t.get_player(3).stack = 12_345
+        await h.cmd(bot.cmd_leave, 3)
+        assert t.get_player(3) is None
+        await h.say(3, "/ㄹㄷ")
+        assert t.get_player(3).stack == 12_345 and "이전 칩 복원" in h.bot.sent[-1][1]
+
+        # Leave mid-hand: the stack after the hand ends is what comes back.
+        await h.say(1, "/ㄱㄱ")
+        leaver = t.current_player.user_id  # first to act 3-handed: no blind posted
+        before = t.get_player(leaver).stack
+        await h.cmd(bot.make_action_cmd("raise"), leaver, "1500")
+        await h.cmd(bot.cmd_leave, leaver)
+        await finish_hand(h, t)
+        left_with = t.departed[leaver]["stack"]
+        assert left_with == before - 1500
+        await h.say(leaver, "/ㄹㄷ")
+        assert t.get_player(leaver).stack == left_with
+
+        # Busted players come back with 0 and must rebuy.
+        await h.cmd(bot.cmd_leave, 2)
+        t.departed[2]["stack"] = 0
+        await h.say(2, "/ㄹㄷ")
+        assert t.get_player(2).stack == 0 and "/rebuy" in h.bot.sent[-1][1]
+
+        # Survives a restart via /loadtable.
+        await h.cmd(bot.cmd_leave, 1)
+        stack1 = t.departed[1]["stack"]
+        await bot.post_shutdown(None)
+        bot.SESSIONS.clear()
+        await h.cmd(bot.cmd_loadtable, OWNER)
+        await h.say(1, "/ㄹㄷ")
+        assert bot.SESSIONS[GROUP_ID].table.get_player(1).stack == stack1
+
+    run(scenario())
+
+
 # ---------------------------------------------------------------- owner & persistence
 import json
 

@@ -36,6 +36,7 @@ class Player:
     timeouts: int = 0  # consecutive turn timeouts (reset on any real action)
     buy_in: int = 0  # total chips bought (starting stack + rebuys)
     rebuys: int = 0
+    returning: bool = False  # rejoined with the stack they left with
 
     @property
     def live(self) -> bool:
@@ -125,6 +126,8 @@ class Table:
         self.action_seq = 0  # bumps on every action; used to expire stale buttons/timers
         self.last_result: HandResult | None = None  # most recently *finished* hand
         self.pending_blinds: tuple[int, int] | None = None
+        # user_id -> {"stack", "buy_in", "rebuys"} of players who left the table
+        self.departed: dict[int, dict] = {}
 
     # ------------------------------------------------------------------ settings
     def set_blinds(self, small_blind: int, big_blind: int) -> bool:
@@ -166,7 +169,12 @@ class Table:
             return existing
         if len(self.players) >= MAX_PLAYERS:
             raise GameError(f"테이블이 가득 찼습니다. (최대 {MAX_PLAYERS}명)")
-        p = Player(user_id, name, self.starting_stack, buy_in=self.starting_stack)
+        prev = self.departed.pop(user_id, None)
+        if prev is not None:  # returning player: restore the chips they left with
+            p = Player(user_id, name, prev["stack"], buy_in=prev["buy_in"], rebuys=prev["rebuys"])
+            p.returning = True
+        else:
+            p = Player(user_id, name, self.starting_stack, buy_in=self.starting_stack)
         self.players.append(p)  # joins mid-hand sit out until the next deal
         return p
 
@@ -204,6 +212,9 @@ class Table:
         return p
 
     def _remove_index(self, i: int) -> None:
+        p = self.players[i]
+        # Remember the stack so a player who leaves and rejoins gets their chips back.
+        self.departed[p.user_id] = {"stack": p.stack, "buy_in": p.buy_in, "rebuys": p.rebuys}
         del self.players[i]
         if i <= self.button:
             self.button -= 1

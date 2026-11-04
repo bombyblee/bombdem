@@ -66,6 +66,19 @@ def snapshot(table: Table, title: str, owner_id: int, turn_timeout: int) -> dict
         "turn_timeout": turn_timeout,
         "hands_played": table.hand_no,
         "players": players,
+        # Players who left (or are leaving this hand), so a rejoin restores their chips.
+        "departed": {
+            **{str(uid): d for uid, d in table.departed.items()},
+            **{
+                str(p.user_id): {
+                    "stack": p.stack + (p.total_bet if table.in_progress else 0),
+                    "buy_in": p.buy_in,
+                    "rebuys": p.rebuys,
+                }
+                for p in table.players
+                if p.leaving
+            },
+        },
     }
 
 
@@ -101,4 +114,5 @@ def restore(chat_id: int, snap: dict) -> Table:
         p.buy_in = d.get("buy_in", stack)
         p.rebuys = d.get("rebuys", 0)
         p.away = d.get("away", False)
+    table.departed = {int(uid): d for uid, d in snap.get("departed", {}).items()}
     return table

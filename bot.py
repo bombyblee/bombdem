@@ -619,6 +619,10 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         t = s.table
         persist(s)
         note = " (다음 핸드부터 참여)" if t.in_progress and not p.in_hand else ""
+        if p.returning:
+            note = " (이전 칩 복원)" + note
+            if p.stack == 0:
+                note += f"\n💀 칩이 없습니다 — /rebuy 로 {chips(REBUY_AMOUNT)} 리바인"
         await send(
             ctx,
             update.effective_chat.id,
