@@ -170,34 +170,39 @@ def test_full_game_flow():
             assert guard < 30
             kb = h.last_keyboard()
             uid = t.current_player.user_id
+            # every turn message opens with whose turn it is
+            turn_msg = next(txt for c, txt, k in reversed(h.bot.sent) if k is not None)
+            assert turn_msg.startswith(f'👉 <a href="tg://user?id={uid}">')
             label = "✔️ 체크" if t.legal_actions().can_check else "📞 콜"
             await h.press(uid, button(kb, label))
 
         last = h.bot.sent[-1][1]
-        assert "결과" in last and "초 후 다음 핸드" in last
+        assert "결과" in last and "다음 핸드 시작: /ㄱㄱ" in last
         assert sum(p.stack for p in t.players) == 3 * bot.DEFAULT_STACK
 
         # stale button from the finished hand
         ans = await h.press(uid, button(kb, label))
         assert ans == ["이미 지나간 차례입니다."]
 
-        # next hand auto-starts via job
-        await h.fire("next:")
+        # no auto-start: only a turn timer may ever be scheduled, never a next-hand job
+        assert not t.in_progress
+        assert all(j.name.startswith("turn:") for j in h.jq.jobs)
+        await h.say(2, "/ㄱㄱ")
         assert t.in_progress and t.hand_no == 2
+        await h.say(2, "/ㄱㄱ")  # can't start a second hand on top of a running one
+        assert h.replies[-1] == "이미 핸드가 진행 중입니다." and t.hand_no == 2
 
         # raise via text command, then timeout auto-folds
         uid = t.current_player.user_id
-        await h.cmd(bot.make_action_cmd("raise"), uid, "500")
-        assert t.current_bet == 500
+        await h.cmd(bot.make_action_cmd("raise"), uid, "1500")
+        assert t.current_bet == 1500
         await h.fire("turn:")
         assert any("시간 초과" in txt for _, txt, _ in h.bot.sent[-2:])
 
-        # stop, finish the hand, close
-        await h.cmd(bot.cmd_stopgame, 1)
+        # finish the hand and close
         while t.in_progress:
             await h.cmd(bot.make_action_cmd("fold"), t.current_player.user_id)
-        assert "게임이 중지" in h.bot.sent[-1][1]
-        assert not h.jq.get_jobs_by_name(f"next:{GROUP_ID}")
+        assert "다음 핸드 시작" in h.bot.sent[-1][1] and not t.in_progress
         await h.cmd(bot.cmd_closetable, 1)
         assert GROUP_ID not in bot.SESSIONS
 

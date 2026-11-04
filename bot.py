@@ -48,7 +48,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("holdem-bot")
 
 TURN_TIMEOUT = int(os.getenv("TURN_TIMEOUT", "60"))
-NEXT_HAND_DELAY = int(os.getenv("NEXT_HAND_DELAY", "8"))
 DEFAULT_STACK = int(os.getenv("DEFAULT_STACK", "30000"))
 DEFAULT_SB = int(os.getenv("DEFAULT_SB", "200"))
 DEFAULT_BB = int(os.getenv("DEFAULT_BB", "500"))
@@ -73,7 +72,6 @@ class Session:
         self.title = title
         self.creator_id = creator_id
         self.lock = asyncio.Lock()  # serialises every state change for this chat
-        self.running = False  # auto-deal next hand
         self.turn_msg_id: int | None = None
         self.turn_timeout = TURN_TIMEOUT
 
@@ -263,17 +261,10 @@ async def handle_events(ctx, chat_id: int, s: Session, events: list[Event], pref
 
 
 def after_hand_footer(ctx, chat_id: int, s: Session) -> str:
-    t = s.table
-    ready = sum(1 for p in t.players if p.stack > 0 and not p.leaving)
-    if s.running and ready >= 2:
-        ctx.job_queue.run_once(
-            next_hand_job, NEXT_HAND_DELAY, data=chat_id, name=f"next:{chat_id}"
-        )
-        return f"⏳ {NEXT_HAND_DELAY}초 후 다음 핸드를 시작합니다. (중지: /stopgame)"
-    if s.running:
-        s.running = False
-        return "⏸ 칩이 있는 플레이어가 부족해 게임을 멈춥니다. /join 또는 /rebuy 후 /begin"
-    return "⏸ 게임이 중지되었습니다. 다시 시작: /begin"
+    ready = sum(1 for p in s.table.players if p.stack > 0 and not p.leaving)
+    if ready >= 2:
+        return "▶️ 다음 핸드 시작: /ㄱㄱ (또는 /begin)"
+    return "⏸ 칩이 있는 플레이어가 부족합니다. /join 또는 /rebuy 후 /ㄱㄱ"
 
 
 async def prompt_turn(ctx, chat_id: int, s: Session, lines: list[str]) -> None:
@@ -281,8 +272,9 @@ async def prompt_turn(ctx, chat_id: int, s: Session, lines: list[str]) -> None:
     p = t.current_player
     la = t.legal_actions()
     need = "체크 가능" if la.can_check else f"콜 {chips(la.to_call)}"
+    # Whose turn it is always comes first, so it shows in notification previews.
     status = f"👉 {mention(p)} 차례 · {need} · ⏱ {s.turn_timeout}초"
-    body = "\n".join(lines + ([""] if lines else []) + [render_table(t), "", status])
+    body = "\n".join([status, ""] + lines + ([""] if lines else []) + [render_table(t)])
     msg = await send(ctx, chat_id, body, reply_markup=turn_keyboard(t))
     s.turn_msg_id = msg.message_id
     ctx.job_queue.run_once(
@@ -298,11 +290,9 @@ async def deal_new_hand(ctx, chat_id: int, s: Session) -> None:
     t = s.table
     if t.in_progress:
         return
-    cancel_jobs(ctx, f"next:{chat_id}")
     try:
         events = t.start_hand()
     except GameError as e:
-        s.running = False
         await send(ctx, chat_id, f"⚠️ {esc(str(e))}")
         return
 
@@ -367,16 +357,6 @@ async def turn_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def next_hand_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = ctx.job.data
-    s = SESSIONS.get(chat_id)
-    if not s or not s.running:
-        return
-    async with s.lock:
-        if s.running:
-            await deal_new_hand(ctx, chat_id, s)
-
-
 # ====================================================================== group commands
 HELP_GROUP = (
     "<b>📖 홀덤봇 명령어 목록</b>\n"
@@ -387,9 +367,8 @@ HELP_GROUP = (
     "/players — 현재 참가자 목록 확인\n"
     "/rebuy — 칩이 부족할 때 리바인 ({rebuy} 추가)\n\n"
     "<b>🎮 게임 진행</b>\n"
-    "/begin — 게임 시작 (2명 이상 필요)\n"
-    "/status — 현재 게임/로비 상태 확인\n"
-    "/stopgame — 현재 핸드가 끝나면 중지\n\n"
+    "/begin — 핸드 시작 (2명 이상 필요, 매 핸드마다 /ㄱㄱ)\n"
+    "/status — 현재 게임/로비 상태 확인\n\n"
     "<b>🃏 액션 (핸드 진행 중)</b>\n"
     "/call — 콜 · /check — 체크 · /fold — 폴드\n"
     "/raise 금액 — 레이즈 (예: /raise 1000, 총 베팅액 기준)\n"
@@ -540,27 +519,10 @@ async def cmd_startgame(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not s:
         return
     async with s.lock:
-        if s.running and s.table.in_progress:
-            await update.effective_message.reply_text("이미 게임이 진행 중입니다.")
-            return
-        s.running = True
-        if s.table.in_progress:  # was paused mid-hand; it will continue automatically
-            await update.effective_message.reply_text("▶️ 현재 핸드가 끝나면 계속 진행합니다.")
+        if s.table.in_progress:
+            await update.effective_message.reply_text("이미 핸드가 진행 중입니다.")
             return
         await deal_new_hand(ctx, update.effective_chat.id, s)
-
-
-async def cmd_stopgame(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    s = await require_session(update)
-    if not s:
-        return
-    async with s.lock:
-        s.running = False
-        cancel_jobs(ctx, f"next:{update.effective_chat.id}")
-        if s.table.in_progress:
-            await update.effective_message.reply_text("⏸ 현재 핸드가 끝나면 멈춥니다.")
-        else:
-            await update.effective_message.reply_text("⏸ 게임을 멈췄습니다. 재개: /startgame")
 
 
 async def is_admin(update: Update, ctx) -> bool:
@@ -582,10 +544,9 @@ async def cmd_closetable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     async with s.lock:
         if s.table.in_progress:
             await update.effective_message.reply_text(
-                "핸드가 진행 중입니다. /stopgame 후 핸드가 끝나면 다시 시도하세요."
+                "핸드가 진행 중입니다. 핸드가 끝난 뒤 다시 시도하세요."
             )
             return
-        cancel_jobs(ctx, f"next:{chat_id}")
         cancel_jobs(ctx, f"turn:{chat_id}")
         del SESSIONS[chat_id]
         standings = sorted(s.table.players, key=lambda p: -p.stack)
@@ -768,8 +729,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = render_table(t)
     if t.in_progress:
         text += f"\n\n👉 {mention(t.current_player)} 차례"
-    elif not s.running:
-        text += "\n\n대기 중 — /startgame 으로 시작"
+    else:
+        text += "\n\n대기 중 — /ㄱㄱ (/begin) 으로 핸드 시작"
     await send(ctx, update.effective_chat.id, text)
 
 
@@ -902,7 +863,7 @@ async def post_init(app: Application) -> None:
             BotCommand("leave", "게임에서 나가기"),
             BotCommand("players", "참가자 목록"),
             BotCommand("rebuy", f"리바인 ({REBUY_AMOUNT:,} 추가)"),
-            BotCommand("begin", "게임 시작"),
+            BotCommand("begin", "핸드 시작"),
             BotCommand("status", "게임/로비 상태"),
             BotCommand("call", "콜"),
             BotCommand("check", "체크"),
@@ -913,7 +874,6 @@ async def post_init(app: Application) -> None:
             BotCommand("timer", "액션 타임아웃 (예: /timer 30)"),
             BotCommand("hand", "전판 내 패 확인 (DM)"),
             BotCommand("open", "전판 커뮤니티 카드 전체 공개"),
-            BotCommand("stopgame", "현재 핸드 후 중지"),
             BotCommand("newtable", "테이블 만들기 [스택] [SB] [BB]"),
             BotCommand("closetable", "테이블 닫기"),
             BotCommand("help", "명령어 목록"),
@@ -953,7 +913,6 @@ def main() -> None:
         "blinds": cmd_blinds,
         "timer": cmd_timer,
         "open": cmd_open,
-        "stopgame": cmd_stopgame,
         "closetable": cmd_closetable,
         "status": cmd_status,
         "raise": make_action_cmd("raise"),
