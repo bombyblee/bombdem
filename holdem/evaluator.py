@@ -66,6 +66,27 @@ def best_hand(cards: list[Card]) -> tuple[Score, list[Card]]:
     return best
 
 
+def arrange_five(cards: list[Card]) -> tuple[list[Card], list[Card]]:
+    """Split a best-five hand into (made part, kickers), each in reading order.
+
+    e.g. pair of kings → ([K, K], [A, 9, 4]); straights/flushes/full houses have no kickers.
+    """
+    score = evaluate5(cards)
+    cat = score[0]
+    if cat in (STRAIGHT, STRAIGHT_FLUSH):
+        wheel = score[1][0] == 5
+        made = sorted(cards, key=lambda c: 1 if wheel and c.rank == 14 else c.rank, reverse=True)
+        return made, []
+    count = Counter(c.rank for c in cards)
+    ordered = sorted(cards, key=lambda c: (count[c.rank], c.rank, c.suit), reverse=True)
+    if cat in (FLUSH, FULL_HOUSE):
+        return ordered, []
+    if cat == HIGH_CARD:
+        return ordered[:1], ordered[1:]
+    made = [c for c in ordered if count[c.rank] >= 2]
+    return made, [c for c in ordered if count[c.rank] < 2]
+
+
 def hand_name(score: Score) -> str:
     if score[0] == STRAIGHT_FLUSH and score[1][0] == 14:
         return "로열 플러시"

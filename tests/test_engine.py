@@ -4,7 +4,7 @@ import pytest
 
 from holdem import game as game_mod
 from holdem.cards import Card, parse_cards
-from holdem.evaluator import best_hand, hand_name
+from holdem.evaluator import arrange_five, best_hand, hand_name
 from holdem.game import FLOP, PREFLOP, GameError, Table
 
 
@@ -347,3 +347,22 @@ def test_suits_use_colour_emoji_form():
     text = format_cards(parse_cards("Ah Kd Qs Jc Tc"))
     assert text == "A♥️ K♦️ Q♠️ J♣️ 10♣️"
     assert text.count("️") == 5
+
+
+def _fmt(cards):
+    return " ".join(f"{'23456789TJQKA'[c.rank - 2]}{c.suit}" for c in cards)
+
+
+def test_arrange_five_made_part_and_kickers():
+    cases = {
+        "4h Ks 9c As Kd": ("Ks Kd", "As 9c 4h"),  # one pair
+        "9c 4h 9d 4s Ah": ("9d 9c 4s 4h", "Ah"),  # two pair
+        "7s 2d 7h Qc 7d": ("7s 7h 7d", "Qc 2d"),  # trips
+        "3c Ah 4d 5s 2h": ("5s 4d 3c 2h Ah", ""),  # wheel: ace plays low
+        "Jh 9h 2h Qh 5h": ("Qh Jh 9h 5h 2h", ""),  # flush
+        "6s Td 6d Tc 6h": ("6s 6h 6d Td Tc", ""),  # full house
+        "Kd 8s 3c Jh 5d": ("Kd", "Jh 8s 5d 3c"),  # high card
+    }
+    for hand, (made, kick) in cases.items():
+        m, k = arrange_five(parse_cards(hand))
+        assert (_fmt(m), _fmt(k)) == (made, kick), hand

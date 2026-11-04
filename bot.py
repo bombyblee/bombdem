@@ -33,7 +33,7 @@ from telegram.ext import (
 )
 
 from holdem.cards import format_cards
-from holdem.evaluator import partial_hand_name
+from holdem.evaluator import arrange_five, partial_hand_name
 from holdem.game import Event, GameError, HandResult, Player, Table
 
 import storage
@@ -162,6 +162,16 @@ def describe(ev: Event) -> str:
     }[ev.action]
 
 
+def describe_best_five(best_five, hole) -> str:
+    """'🃏 K♠️ K♦️ + A♠️ 9♣️ 4♥️ · 손패 2장' — made cards, then kickers, then hole cards used."""
+    made, kickers = arrange_five(best_five)
+    text = f"🃏 BEST 5: <b>{format_cards(made)}</b>"
+    if kickers:
+        text += f" + {format_cards(kickers)}"
+    used = sum(1 for c in best_five if c in hole)
+    return text + (f" · 손패 {used}장 사용" if used else " · 보드 플레이")
+
+
 def render_result(r: HandResult, t: Table) -> str:
     lines = [f"🏁 <b>핸드 #{r.hand_no} 결과</b>"]
     if r.uncontested:
@@ -171,7 +181,8 @@ def render_result(r: HandResult, t: Table) -> str:
         lines.append(f"보드: <b>{format_cards(r.board)}</b>")
         lines.append("")
         for e in r.showdown:
-            lines.append(f"• {esc(e.player.name)}: {format_cards(e.hole)} → {e.hand_label}")
+            lines.append(f"• {esc(e.player.name)}: {format_cards(e.hole)} → <b>{e.hand_label}</b>")
+            lines.append(f"   {describe_best_five(e.best_five, e.hole)}")
         lines.append("")
         contested = [p for p in r.pots if len(p.eligible) > 1]
         for i, pot in enumerate(r.pots):
