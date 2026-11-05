@@ -35,6 +35,7 @@ from telegram.ext import (
 from holdem.cards import format_cards
 from holdem.evaluator import arrange_five, partial_hand_name
 from holdem.game import Event, GameError, HandResult, Player, Table
+from holdem.settle import settle
 
 import storage
 
@@ -740,13 +741,33 @@ async def cmd_closetable(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             storage.delete(TABLES_FILE, chat_id)  # finished table: nothing left to /loadtable
         except Exception:
             log.exception("failed to delete saved table %s", chat_id)
-        standings = sorted(s.table.players, key=lambda p: -p.stack)
-        lines = ["🏁 <b>테이블 종료</b> — 최종 칩"]
-        for i, p in enumerate(standings, 1):
-            diff = p.stack - p.buy_in
-            rebuy = f" · 리바인 {p.rebuys}회" if p.rebuys else ""
-            lines.append(f"{i}. {esc(p.name)} {chips(p.stack)} ({diff:+,}){rebuy}")
-        await send(ctx, chat_id, "\n".join(lines))
+        await send(ctx, chat_id, render_settlement(s.table))
+
+
+def render_settlement(t: Table) -> str:
+    """Final standings for everyone who played (incl. those who left) + who pays whom."""
+    rows = {p.user_id: (p.name, p.stack, p.buy_in, p.rebuys, "") for p in t.players}
+    for uid, d in t.departed.items():
+        rows[uid] = (d.get("name") or f"ID {uid}", d["stack"], d["buy_in"], d.get("rebuys", 0), " · 퇴장")
+    lines = ["🏁 <b>테이블 종료</b> — 최종 칩 (손익)"]
+    standings = sorted(rows.items(), key=lambda kv: -(kv[1][1] - kv[1][2]))
+    for i, (_, (name, stack, buy_in, rebuys, tag)) in enumerate(standings, 1):
+        rebuy = f" · 리바인 {rebuys}회" if rebuys else ""
+        lines.append(f"{i}. {esc(name)} {chips(stack)} (<b>{stack - buy_in:+,}</b>){rebuy}{tag}")
+    nets = {uid: r[1] - r[2] for uid, r in rows.items()}
+    try:
+        transfers = settle(nets)
+    except ValueError:  # chips don't add up (shouldn't happen) — show standings only
+        log.error("settlement nets don't sum to zero: %s", nets)
+        return "\n".join(lines + ["", "⚠️ 칩 합계가 맞지 않아 정산을 계산하지 못했습니다."])
+    lines.append("")
+    if not transfers:
+        lines.append("💸 정산할 금액이 없습니다.")
+    else:
+        lines.append(f"💸 <b>정산</b> (송금 {len(transfers)}회)")
+        for payer, receiver, amount in transfers:
+            lines.append(f"• {esc(rows[payer][0])} → {esc(rows[receiver][0])} <b>{chips(amount)}</b>")
+    return "\n".join(lines)
 
 
 async def cmd_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

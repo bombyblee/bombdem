@@ -516,6 +516,32 @@ def test_allow_opens_newtable_and_closetable():
     run(scenario())
 
 
+def test_closetable_settlement():
+    async def scenario():
+        h = Harness()
+        await h.cmd(bot.cmd_newtable, OWNER)
+        for uid in (1, 2, 3, 4):
+            await h.cmd(bot.cmd_join, uid)
+        t = bot.SESSIONS[GROUP_ID].table
+        p = {u: t.get_player(u) for u in (1, 2, 3, 4)}
+        # 1: +20,000 · 2: -20,000 (after a rebuy) · 3: +5,000 (left) · 4: -5,000
+        p[2].stack = 0
+        await h.cmd(bot.cmd_rebuy, 2)
+        p[2].stack = 40_000  # bought 60,000 in total
+        p[1].stack = 50_000
+        p[3].stack = 35_000
+        p[4].stack = 25_000
+        await h.cmd(bot.cmd_leave, 3)
+        await h.cmd(bot.cmd_closetable, OWNER)
+        text = h.bot.sent[-1][1]
+        assert "송금 2회" in text and "퇴장" in text and "리바인 1회" in text
+        names = {u: p[u].name for u in p}
+        assert f"{names[2]} → {names[1]} <b>20,000</b>" in text
+        assert f"{names[4]} → {names[3]} <b>5,000</b>" in text
+
+    run(scenario())
+
+
 def test_no_owner_configured(monkeypatch):
     async def scenario():
         monkeypatch.setattr(bot, "OWNER_IDS", set())

@@ -214,7 +214,12 @@ class Table:
     def _remove_index(self, i: int) -> None:
         p = self.players[i]
         # Remember the stack so a player who leaves and rejoins gets their chips back.
-        self.departed[p.user_id] = {"stack": p.stack, "buy_in": p.buy_in, "rebuys": p.rebuys}
+        self.departed[p.user_id] = {
+            "name": p.name,
+            "stack": p.stack,
+            "buy_in": p.buy_in,
+            "rebuys": p.rebuys,
+        }
         del self.players[i]
         if i <= self.button:
             self.button -= 1

@@ -71,6 +71,7 @@ def snapshot(table: Table, title: str, owner_id: int, turn_timeout: int) -> dict
             **{str(uid): d for uid, d in table.departed.items()},
             **{
                 str(p.user_id): {
+                    "name": p.name,
                     "stack": p.stack + (p.total_bet if table.in_progress else 0),
                     "buy_in": p.buy_in,
                     "rebuys": p.rebuys,
